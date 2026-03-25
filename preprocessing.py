@@ -85,6 +85,7 @@ def detect_click_events(
     frames: list[np.ndarray],
     positions: list[Tuple[Optional[int], Optional[int]]],
     *,
+    ui_change_scores: Optional[list[float]] = None,
     halo_reference_path: str = "click_event.png",
     inner_radius_px: int = 10,
     outer_radius_px: int = 24,
@@ -93,6 +94,7 @@ def detect_click_events(
     candidate_jitter_radius_px: int = 36,
     candidate_step_px: int = 10,
     z_threshold: float = 1.25,
+    weak_z_threshold: float = 0.15,
     min_absolute_score: float = 0.04,
     min_separation_frames: int = 4,
     fps: Optional[float] = None,
@@ -208,6 +210,16 @@ def detect_click_events(
         min_absolute_score,
         baseline + float(z_threshold) * spread,
     )
+    weak_threshold = max(
+        min_absolute_score,
+        baseline + float(weak_z_threshold) * spread,
+    )
+
+    ui_arr: Optional[np.ndarray] = None
+    ui_high_threshold = 0.0
+    if ui_change_scores is not None and len(ui_change_scores) >= n:
+        ui_arr = np.asarray(ui_change_scores[:n], dtype=np.float32)
+        ui_high_threshold = float(np.percentile(ui_arr, 90))
 
     # Peak-picking: frame i is a click if it's a local maximum over threshold.
     peaks = np.zeros(n, dtype=bool)
@@ -217,7 +229,13 @@ def detect_click_events(
         left = float(scores[i - 1]) if valid[i - 1] else -np.inf
         right = float(scores[i + 1]) if valid[i + 1] else -np.inf
         s = float(scores[i])
-        if s >= threshold and s >= left and s > right:
+        strong_halo = s >= threshold
+        weak_halo_with_ui = (
+            (ui_arr is not None)
+            and (s >= weak_threshold)
+            and (float(ui_arr[i]) >= ui_high_threshold)
+        )
+        if (strong_halo or weak_halo_with_ui) and s >= left and s > right:
             peaks[i] = True
 
     # Edge frames: allow them to be peaks too.
@@ -406,6 +424,58 @@ def _smooth_1d(values: list[float], window: int = 7) -> list[float]:
     return out.astype(np.float32).tolist()
 
 
+def detect_stop_events(
+    speed_series: list[float],
+    fps: float,
+    *,
+    stable_stop_seconds: float = 1.0,
+    low_speed_threshold: Optional[float] = None,
+    min_separation_seconds: float = 1.0,
+) -> list[bool]:
+    """
+    Detect stop events where smoothed speed stays low continuously for >= stable_stop_seconds.
+    """
+    n = len(speed_series)
+    if n == 0:
+        return []
+
+    dt = 1.0 / float(fps) if fps and fps > 0 else 1.0 / 30.0
+    stable_frames = max(1, int(round(float(stable_stop_seconds) / dt)))
+    sep_frames = max(1, int(round(float(min_separation_seconds) / dt)))
+
+    speed_smooth = _smooth_1d(speed_series, window=7)
+    if len(speed_smooth) < n:
+        speed_smooth = speed_smooth + [0.0] * (n - len(speed_smooth))
+    arr = np.asarray(speed_smooth[:n], dtype=np.float32)
+
+    if low_speed_threshold is None:
+        nonzero = arr[arr > 1e-6]
+        if nonzero.size > 0:
+            low_speed_threshold = float(np.percentile(nonzero, 25))
+        else:
+            low_speed_threshold = 40.0
+
+    low = arr <= float(low_speed_threshold)
+    raw_stops = np.zeros(n, dtype=bool)
+    run = 0
+    for i in range(n):
+        if low[i]:
+            run += 1
+            if run >= stable_frames:
+                raw_stops[i] = True
+        else:
+            run = 0
+
+    # De-duplicate nearby stop detections.
+    out = np.zeros(n, dtype=bool)
+    last = -10_000
+    for i in range(n):
+        if raw_stops[i] and (i - last) >= sep_frames:
+            out[i] = True
+            last = i
+    return out.tolist()
+
+
 def build_smart_zoom_controls(
     positions: list[Tuple[Optional[int], Optional[int]]],
     click_events: list[bool],
@@ -419,8 +489,9 @@ def build_smart_zoom_controls(
     lookback_seconds: float = 0.25,
     hold_after_click_seconds: float = 0.5,
     idle_zoom_out_seconds: float = 0.75,
-    zoom_in_min_seconds: float = 0.18,
-    reanchor_seconds: float = 0.22,
+    zoom_in_min_seconds: float = 0.80,
+    reanchor_seconds: float = 0.55,
+    stable_stop_seconds: float = 1.0,
     low_speed_threshold: Optional[float] = None,
     interaction_ui_threshold: Optional[float] = None,
 ) -> Tuple[list[float], list[Tuple[int, int]]]:
@@ -457,6 +528,7 @@ def build_smart_zoom_controls(
     idle_frames = max(1, int(round(idle_zoom_out_seconds / dt)))
     reanchor_frames = max(2, int(round(reanchor_seconds / dt)))
     zoom_in_min_frames = max(2, int(round(zoom_in_min_seconds / dt)))
+    stable_stop_frames = max(1, int(round(max(0.0, float(stable_stop_seconds)) / dt)))
 
     def _valid_pos(i: int) -> Optional[Tuple[int, int]]:
         if i < 0 or i >= n:
@@ -476,9 +548,14 @@ def build_smart_zoom_controls(
         return None
 
     def _stable_before(i: int) -> Optional[Tuple[int, int]]:
-        lo = max(0, i - back_frames)
+        # A valid ending position requires continuous low-speed stop for >= stable_stop_seconds.
+        search_back = max(back_frames, stable_stop_frames + 2)
+        lo = max(0, i - search_back)
         for j in range(i, lo - 1, -1):
-            if speed_arr[j] <= float(low_speed_threshold):
+            start = j - stable_stop_frames + 1
+            if start < 0:
+                continue
+            if np.all(speed_arr[start : j + 1] <= float(low_speed_threshold)):
                 p = _valid_pos(j)
                 if p is not None:
                     return p
@@ -512,6 +589,7 @@ def build_smart_zoom_controls(
     pan_end = -1
     pan_from = anchor_curr
     pan_to = anchor_curr
+    click_ptr = 0
 
     def _begin_zoom_transition(i: int, to_level: float, duration_frames: int) -> None:
         nonlocal transition_start, transition_end, transition_from, transition_to
@@ -531,6 +609,10 @@ def build_smart_zoom_controls(
         )
 
     for i in range(n):
+        while click_ptr < len(click_idxs) and click_idxs[click_ptr] <= i:
+            click_ptr += 1
+        next_click_idx: Optional[int] = click_idxs[click_ptr] if click_ptr < len(click_idxs) else None
+
         if i in zoom_start_map:
             c = zoom_start_map[i]
             c_anchor = _stable_before(c)
@@ -563,7 +645,7 @@ def build_smart_zoom_controls(
             # Keep zoomed; smoothly pan/re-anchor without snapping to full frame.
             pan_frames = reanchor_frames if in_inner else int(round(1.25 * reanchor_frames))
             _begin_pan(i, click_anchor, pan_frames)
-            _begin_zoom_transition(i, 1.0, max(2, int(round(0.12 / dt))))
+            _begin_zoom_transition(i, 1.0, max(2, int(round(0.45 / dt))))
             zoom_active = True
             hold_until = max(hold_until, i + hold_frames)
             inactivity_count = 0
@@ -600,7 +682,31 @@ def build_smart_zoom_controls(
             else:
                 inactivity_count += 1
                 if inactivity_count >= idle_frames and float(level[i]) > 1e-3:
-                    _begin_zoom_transition(i, 0.0, max(zoom_in_min_frames, idle_frames // 2))
+                    # If the next action is already within the current inner bounds,
+                    # keep zoomed state and do not zoom back out to full frame.
+                    keep_zoom_for_next_action = False
+                    if next_click_idx is not None:
+                        next_anchor = _stable_before(next_click_idx)
+                        if next_anchor is None:
+                            next_anchor = _last_valid_before(next_click_idx)
+                        if next_anchor is not None:
+                            p_now = float(np.clip(level[i], 0.0, 1.0))
+                            p_now_s = p_now * p_now * (3.0 - 2.0 * p_now)
+                            roi_w_now = float(frame_width) + (
+                                float(frame_width) / max(1.0, max_zoom) - float(frame_width)
+                            ) * p_now_s
+                            roi_h_now = float(frame_height) + (
+                                float(frame_height) / max(1.0, max_zoom) - float(frame_height)
+                            ) * p_now_s
+                            keep_zoom_for_next_action = (
+                                abs(float(next_anchor[0]) - float(anchor_curr[0])) <= 0.30 * roi_w_now
+                                and abs(float(next_anchor[1]) - float(anchor_curr[1])) <= 0.30 * roi_h_now
+                            )
+                    if keep_zoom_for_next_action:
+                        inactivity_count = idle_frames
+                        anchors[i] = anchor_curr
+                        continue
+                    _begin_zoom_transition(i, 0.0, max(zoom_in_min_frames, int(round(1.25 * idle_frames))))
                     zoom_active = False
                     inactivity_count = 0
 
@@ -1086,12 +1192,14 @@ if __name__ == "__main__":
     click_events, click_halo_centers = detect_click_events(
         frames,
         cursor_positions,
+        ui_change_scores=ui_change_scores,
         halo_reference_path="click_event.png",
         fps=fps,
         min_separation_seconds=1.00,
         return_halo_centers=True,
     )
     vel_x, vel_y, speed, acceleration = compute_cursor_kinematics(cursor_positions, fps)
+    stop_events = detect_stop_events(speed, fps, stable_stop_seconds=1.0)
 
     #do the cursor overlay (with smart click-centric zoom)
     visualize_cursor_positions(
@@ -1126,6 +1234,9 @@ if __name__ == "__main__":
     for i, is_click in enumerate(click_events):
         if is_click:
             print(f"Click detected at timestamp: {i / fps:.3f}s")
+    for i, is_stop in enumerate(stop_events):
+        if is_stop:
+            print(f"Stop detected at timestamp: {i / fps:.3f}s")
     rows: list[FrameData] = []
     for i in range(len(frames)):
         x, y = cursor_positions[i]
