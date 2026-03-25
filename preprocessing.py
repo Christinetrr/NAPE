@@ -42,6 +42,235 @@ def get_frames(path: str, show: bool = False):
             cv2.destroyAllWindows()
     return frames
 
+
+def _estimate_blue_halo_hsv_bounds(reference_path: str) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Estimate HSV bounds for the blue click halo from a reference image.
+    Falls back to conservative defaults if estimation is unavailable.
+    """
+    # Default blue range (OpenCV HSV: H in [0,179]).
+    default_lower = np.array([85, 50, 50], dtype=np.uint8)
+    default_upper = np.array([135, 255, 255], dtype=np.uint8)
+
+    ref = cv2.imread(str(reference_path), cv2.IMREAD_COLOR)
+    if ref is None or ref.size == 0:
+        return default_lower, default_upper
+
+    hsv = cv2.cvtColor(ref, cv2.COLOR_BGR2HSV)
+
+    # Bootstrap a "blue-ish" mask, then tighten with robust percentiles.
+    seed = cv2.inRange(hsv, np.array([80, 40, 40], dtype=np.uint8), np.array([140, 255, 255], dtype=np.uint8))
+    ys, xs = np.where(seed > 0)
+    if len(xs) < 20:
+        return default_lower, default_upper
+
+    sample = hsv[ys, xs]  # N x 3
+    h = sample[:, 0].astype(np.float32)
+    s = sample[:, 1].astype(np.float32)
+    v = sample[:, 2].astype(np.float32)
+
+    h_lo = int(np.clip(np.percentile(h, 5) - 5, 0, 179))
+    h_hi = int(np.clip(np.percentile(h, 95) + 5, 0, 179))
+    s_lo = int(np.clip(np.percentile(s, 20) - 15, 20, 255))
+    v_lo = int(np.clip(np.percentile(v, 20) - 15, 20, 255))
+
+    lower = np.array([h_lo, s_lo, v_lo], dtype=np.uint8)
+    upper = np.array([h_hi, 255, 255], dtype=np.uint8)
+    return lower, upper
+
+
+#matches halo click event template to a radius around cursor position
+#if match, record click event at the frame setting it to True, else False
+def detect_click_events(
+    frames: list[np.ndarray],
+    positions: list[Tuple[Optional[int], Optional[int]]],
+    *,
+    halo_reference_path: str = "click_event.png",
+    inner_radius_px: int = 10,
+    outer_radius_px: int = 24,
+    patch_radius_px: int = 30,
+    z_threshold: float = 1.25,
+    min_absolute_score: float = 0.04,
+    min_separation_frames: int = 4,
+) -> list[bool]:
+    n = min(len(frames), len(positions))
+    if n == 0:
+        return []
+
+    lower_hsv, upper_hsv = _estimate_blue_halo_hsv_bounds(halo_reference_path)
+    scores = np.full(n, np.nan, dtype=np.float32)
+
+    inner_r2 = float(inner_radius_px * inner_radius_px)
+    outer_r2 = float(outer_radius_px * outer_radius_px)
+
+    for i in range(n):
+        x, y = positions[i]
+        if x is None or y is None:
+            continue
+
+        frame = frames[i]
+        if frame is None or frame.size == 0:
+            continue
+
+        h, w = frame.shape[:2]
+        cx = int(np.clip(int(x), 0, w - 1))
+        cy = int(np.clip(int(y), 0, h - 1))
+
+        x0 = max(0, cx - patch_radius_px)
+        x1 = min(w, cx + patch_radius_px + 1)
+        y0 = max(0, cy - patch_radius_px)
+        y1 = min(h, cy + patch_radius_px + 1)
+        patch = frame[y0:y1, x0:x1]
+        if patch.size == 0:
+            continue
+
+        patch_hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+        blue_mask = cv2.inRange(patch_hsv, lower_hsv, upper_hsv)  # bit mask for blue halo
+
+        # Build geometric masks centered on cursor for ring vs center.
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        dx = xx.astype(np.float32) - float(cx)
+        dy = yy.astype(np.float32) - float(cy)
+        d2 = dx * dx + dy * dy
+
+        ring_mask = (d2 > inner_r2) & (d2 <= outer_r2)
+        center_mask = d2 <= inner_r2
+        if not np.any(ring_mask):
+            continue
+
+        # Convert bool masks to uint8 for bitwise operations.
+        ring_u8 = (ring_mask.astype(np.uint8) * 255)
+        center_u8 = (center_mask.astype(np.uint8) * 255)
+
+        ring_blue = cv2.bitwise_and(blue_mask, blue_mask, mask=ring_u8)
+        center_blue = cv2.bitwise_and(blue_mask, blue_mask, mask=center_u8)
+
+        ring_ratio = float(np.count_nonzero(ring_blue)) / float(np.count_nonzero(ring_mask))
+        center_ratio = (
+            float(np.count_nonzero(center_blue)) / float(np.count_nonzero(center_mask))
+            if np.any(center_mask)
+            else 0.0
+        )
+
+        # Favor frames where blue is concentrated in annulus (halo) not center (cursor body).
+        scores[i] = ring_ratio - 0.5 * center_ratio
+
+    valid = np.isfinite(scores)
+    if not np.any(valid):
+        return [False] * n
+
+    valid_scores = scores[valid]
+    baseline = float(np.median(valid_scores))
+    spread = float(np.std(valid_scores))
+    threshold = max(
+        min_absolute_score,
+        baseline + float(z_threshold) * spread,
+    )
+
+    # Peak-picking: frame i is a click if it's a local maximum over threshold.
+    peaks = np.zeros(n, dtype=bool)
+    for i in range(1, n - 1):
+        if not valid[i]:
+            continue
+        left = float(scores[i - 1]) if valid[i - 1] else -np.inf
+        right = float(scores[i + 1]) if valid[i + 1] else -np.inf
+        s = float(scores[i])
+        if s >= threshold and s >= left and s > right:
+            peaks[i] = True
+
+    # Edge frames: allow them to be peaks too.
+    if n >= 1 and valid[0] and float(scores[0]) >= threshold:
+        right0 = float(scores[1]) if n > 1 and valid[1] else -np.inf
+        if float(scores[0]) > right0:
+            peaks[0] = True
+    if n >= 2 and valid[n - 1] and float(scores[n - 1]) >= threshold:
+        leftn = float(scores[n - 2]) if valid[n - 2] else -np.inf
+        if float(scores[n - 1]) >= leftn:
+            peaks[n - 1] = True
+
+    # Enforce minimum spacing between click frames.
+    click_flags = np.zeros(n, dtype=bool)
+    if min_separation_frames > 0:
+        last_kept = -10_000
+        for i in range(n):
+            if peaks[i] and (i - last_kept) >= int(min_separation_frames):
+                click_flags[i] = True
+                last_kept = i
+    else:
+        click_flags = peaks
+
+    return click_flags.tolist()
+
+
+def compute_ui_change_scores(
+    frames: list[np.ndarray],
+    positions: list[Tuple[Optional[int], Optional[int]]],
+    *,
+    patch_radius_px: int = 36,
+    blur_ksize: int = 3,
+) -> list[float]:
+    """
+    Compute per-frame UI change near cursor by comparing to previous frame.
+
+    Score definition:
+      mean(abs(curr_patch - prev_patch)) / 255.0  -> in [0, 1]
+    """
+    n = min(len(frames), len(positions))
+    if n == 0:
+        return []
+
+    scores = [0.0] * n
+    if n == 1:
+        return scores
+
+    k = max(1, int(blur_ksize))
+    if k % 2 == 0:
+        k += 1
+
+    prev_gray = cv2.cvtColor(frames[0], cv2.COLOR_BGR2GRAY).astype(np.float32)
+    if k >= 3:
+        prev_gray = cv2.GaussianBlur(prev_gray, (k, k), 0)
+
+    last_valid_pos: Optional[Tuple[int, int]] = None
+    x0, y0 = positions[0]
+    if x0 is not None and y0 is not None:
+        last_valid_pos = (int(x0), int(y0))
+
+    for i in range(1, n):
+        curr_gray = cv2.cvtColor(frames[i], cv2.COLOR_BGR2GRAY).astype(np.float32)
+        if k >= 3:
+            curr_gray = cv2.GaussianBlur(curr_gray, (k, k), 0)
+
+        h, w = curr_gray.shape[:2]
+        x, y = positions[i]
+        if x is not None and y is not None:
+            cx, cy = int(x), int(y)
+            last_valid_pos = (cx, cy)
+        elif last_valid_pos is not None:
+            cx, cy = last_valid_pos
+        else:
+            cx, cy = w // 2, h // 2
+
+        cx = int(np.clip(cx, 0, w - 1))
+        cy = int(np.clip(cy, 0, h - 1))
+
+        px0 = max(0, cx - patch_radius_px)
+        px1 = min(w, cx + patch_radius_px + 1)
+        py0 = max(0, cy - patch_radius_px)
+        py1 = min(h, cy + patch_radius_px + 1)
+
+        curr_patch = curr_gray[py0:py1, px0:px1]
+        prev_patch = prev_gray[py0:py1, px0:px1]
+        if curr_patch.size == 0 or prev_patch.size == 0:
+            scores[i] = 0.0
+        else:
+            mad = float(np.mean(np.abs(curr_patch - prev_patch)))
+            scores[i] = mad / 255.0
+
+        prev_gray = curr_gray
+
+    return scores
+
 '''CURSOR METRICS EXTRACTION: template matching + iterate over all 
    frames + compute match confidence score to template + record cursor
    tip position as x and y only if confidence above threshold. 
@@ -273,8 +502,6 @@ def visualize_cursor_positions(
         idx = 0
         if early_seconds is not None:
             early_end_idx = int(early_seconds * fps)
-        # NOTE: zooming is intentionally not applied during visualization.
-        # `zoom_roi(...)` exists as a reusable helper, but is not called here.
         while True:
             ret, frame = cap.read()
             if not ret or idx >= len(positions):
@@ -475,21 +702,30 @@ if __name__ == "__main__":
 
     
     #BUILD DATAFRAME OF FRAME METRICS
+    ui_change_scores = compute_ui_change_scores(frames, cursor_positions)
+    click_events = detect_click_events(frames, cursor_positions, halo_reference_path="click_event.png")
+    for i, is_click in enumerate(click_events):
+        if is_click:
+            print(f"Click detected at timestamp: {i / fps:.3f}s")
     rows: list[FrameData] = []
     for i in range(len(frames)):
         x, y = cursor_positions[i]
+        #if click event if detected, record {timestamp, x position, y position}
+        #otherwise record False as default
+        click_metric: bool | MouseClick = False
+        if i < len(click_events) and click_events[i]:
+            click_metric = MouseClick(
+                timestamp=i / fps,
+                x_pos=float("nan") if x is None else float(x),
+                y_pos=float("nan") if y is None else float(y),
+            )
         row = FrameData(
             frame=i,
             timestamp=i / fps,
             cursor_x=float("nan") if x is None else float(x),
             cursor_y=float("nan") if y is None else float(y),
             cursor_match_score=float(scores[i]),
-            mouse_click_event=MouseClick(
-                click=False,
-                timestamp=i / fps,
-                x_pos=float("nan") if x is None else float(x),
-                y_pos=float("nan") if y is None else float(y),
-            ),
+            mouse_click_event=click_metric,
             mouse_drag_event=MouseDrag(drag=False, start_pos=0.0, end_pos=0.0),
             vel_x=0.0,
             vel_y=0.0,
@@ -500,11 +736,10 @@ if __name__ == "__main__":
             nearest_target_objects=[],
             dist_cursor_to_target=0.0,
             in_target_zone=False,
-            ui_change_score=0.0,
+            ui_change_score=float(ui_change_scores[i]) if i < len(ui_change_scores) else 0.0,
         )
         rows.append(row)
 
     df = pd.DataFrame(rows)
-    print(df.head())
 
     

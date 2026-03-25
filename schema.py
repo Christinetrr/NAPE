@@ -9,7 +9,6 @@ class MouseDrag:
     end_pos: float
 @dataclass
 class MouseClick:
-    click: bool
     timestamp: float
     x_pos: float
     y_pos: float
@@ -20,7 +19,7 @@ class FrameData:
     cursor_x: float 
     cursor_y: float
     cursor_match_score: float
-    mouse_click_event: MouseClick  
+    mouse_click_event: bool | MouseClick  
     mouse_drag_event:  MouseDrag
     vel_x: float  
     vel_y: float 
