@@ -89,23 +89,36 @@ def detect_click_events(
     inner_radius_px: int = 10,
     outer_radius_px: int = 24,
     patch_radius_px: int = 30,
+    halo_search_radius_px: int = 70,
+    candidate_jitter_radius_px: int = 36,
+    candidate_step_px: int = 10,
     z_threshold: float = 1.25,
     min_absolute_score: float = 0.04,
     min_separation_frames: int = 4,
-) -> list[bool]:
+    fps: Optional[float] = None,
+    min_separation_seconds: float = 1.00,
+    return_halo_centers: bool = False,
+) -> list[bool] | Tuple[list[bool], list[Optional[Tuple[int, int]]]]:
     n = min(len(frames), len(positions))
     if n == 0:
+        if return_halo_centers:
+            return [], []
         return []
 
     lower_hsv, upper_hsv = _estimate_blue_halo_hsv_bounds(halo_reference_path)
     scores = np.full(n, np.nan, dtype=np.float32)
+    halo_centers: list[Optional[Tuple[int, int]]] = [None] * n
 
     inner_r2 = float(inner_radius_px * inner_radius_px)
     outer_r2 = float(outer_radius_px * outer_radius_px)
+    last_detected_pos: Optional[Tuple[int, int]] = None
 
     for i in range(n):
         x, y = positions[i]
-        if x is None or y is None:
+        if x is not None and y is not None:
+            last_detected_pos = (int(x), int(y))
+
+        if last_detected_pos is None and (x is None or y is None):
             continue
 
         frame = frames[i]
@@ -113,51 +126,80 @@ def detect_click_events(
             continue
 
         h, w = frame.shape[:2]
-        cx = int(np.clip(int(x), 0, w - 1))
-        cy = int(np.clip(int(y), 0, h - 1))
+        if last_detected_pos is not None:
+            anchor_x, anchor_y = last_detected_pos
+        else:
+            anchor_x, anchor_y = int(x), int(y)  # for type checker
+        anchor_x = int(np.clip(anchor_x, 0, w - 1))
+        anchor_y = int(np.clip(anchor_y, 0, h - 1))
 
-        x0 = max(0, cx - patch_radius_px)
-        x1 = min(w, cx + patch_radius_px + 1)
-        y0 = max(0, cy - patch_radius_px)
-        y1 = min(h, cy + patch_radius_px + 1)
-        patch = frame[y0:y1, x0:x1]
+        # Search in a larger window around last detected cursor position.
+        sx0 = max(0, anchor_x - int(halo_search_radius_px))
+        sx1 = min(w, anchor_x + int(halo_search_radius_px) + 1)
+        sy0 = max(0, anchor_y - int(halo_search_radius_px))
+        sy1 = min(h, anchor_y + int(halo_search_radius_px) + 1)
+        patch = frame[sy0:sy1, sx0:sx1]
         if patch.size == 0:
             continue
 
         patch_hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
         blue_mask = cv2.inRange(patch_hsv, lower_hsv, upper_hsv)  # bit mask for blue halo
 
-        # Build geometric masks centered on cursor for ring vs center.
-        yy, xx = np.ogrid[y0:y1, x0:x1]
-        dx = xx.astype(np.float32) - float(cx)
-        dy = yy.astype(np.float32) - float(cy)
-        d2 = dx * dx + dy * dy
+        # Candidate centers around anchor (plus current tracked point if available).
+        candidates: list[Tuple[int, int]] = []
+        jitter = max(0, int(candidate_jitter_radius_px))
+        step = max(1, int(candidate_step_px))
+        for dy in range(-jitter, jitter + 1, step):
+            for dx in range(-jitter, jitter + 1, step):
+                cx = int(np.clip(anchor_x + dx, 0, w - 1))
+                cy = int(np.clip(anchor_y + dy, 0, h - 1))
+                candidates.append((cx, cy))
+        if x is not None and y is not None:
+            candidates.append((int(np.clip(int(x), 0, w - 1)), int(np.clip(int(y), 0, h - 1))))
 
-        ring_mask = (d2 > inner_r2) & (d2 <= outer_r2)
-        center_mask = d2 <= inner_r2
-        if not np.any(ring_mask):
-            continue
+        yy, xx = np.ogrid[sy0:sy1, sx0:sx1]
+        best_score = -1.0
+        best_center: Optional[Tuple[int, int]] = None
 
-        # Convert bool masks to uint8 for bitwise operations.
-        ring_u8 = (ring_mask.astype(np.uint8) * 255)
-        center_u8 = (center_mask.astype(np.uint8) * 255)
+        for cx, cy in candidates:
+            dx = xx.astype(np.float32) - float(cx)
+            dy = yy.astype(np.float32) - float(cy)
+            d2 = dx * dx + dy * dy
 
-        ring_blue = cv2.bitwise_and(blue_mask, blue_mask, mask=ring_u8)
-        center_blue = cv2.bitwise_and(blue_mask, blue_mask, mask=center_u8)
+            ring_mask = (d2 > inner_r2) & (d2 <= outer_r2)
+            center_mask = d2 <= inner_r2
+            if not np.any(ring_mask):
+                continue
 
-        ring_ratio = float(np.count_nonzero(ring_blue)) / float(np.count_nonzero(ring_mask))
-        center_ratio = (
-            float(np.count_nonzero(center_blue)) / float(np.count_nonzero(center_mask))
-            if np.any(center_mask)
-            else 0.0
-        )
+            ring_u8 = (ring_mask.astype(np.uint8) * 255)
+            center_u8 = (center_mask.astype(np.uint8) * 255)
+            ring_blue = cv2.bitwise_and(blue_mask, blue_mask, mask=ring_u8)
+            center_blue = cv2.bitwise_and(blue_mask, blue_mask, mask=center_u8)
 
-        # Favor frames where blue is concentrated in annulus (halo) not center (cursor body).
-        scores[i] = ring_ratio - 0.5 * center_ratio
+            ring_ratio = float(np.count_nonzero(ring_blue)) / float(np.count_nonzero(ring_mask))
+            center_ratio = (
+                float(np.count_nonzero(center_blue)) / float(np.count_nonzero(center_mask))
+                if np.any(center_mask)
+                else 0.0
+            )
+            s = ring_ratio - 0.5 * center_ratio
+            if s > best_score:
+                best_score = s
+                best_center = (cx, cy)
+
+        if best_score >= 0.0:
+            scores[i] = float(best_score)
+            if best_center is not None:
+                halo_centers[i] = (int(best_center[0]), int(best_center[1]))
+                # Track best halo center to stabilize next frame's search anchor.
+                last_detected_pos = best_center
 
     valid = np.isfinite(scores)
     if not np.any(valid):
-        return [False] * n
+        out = [False] * n
+        if return_halo_centers:
+            return out, halo_centers
+        return out
 
     valid_scores = scores[valid]
     baseline = float(np.median(valid_scores))
@@ -188,18 +230,38 @@ def detect_click_events(
         if float(scores[n - 1]) >= leftn:
             peaks[n - 1] = True
 
-    # Enforce minimum spacing between click frames.
-    click_flags = np.zeros(n, dtype=bool)
-    if min_separation_frames > 0:
-        last_kept = -10_000
-        for i in range(n):
-            if peaks[i] and (i - last_kept) >= int(min_separation_frames):
-                click_flags[i] = True
-                last_kept = i
-    else:
-        click_flags = peaks
+    # Enforce minimum spacing between click frames (time-based preferred).
+    sep_frames = int(min_separation_frames)
+    if fps is not None and fps > 0 and min_separation_seconds > 0:
+        sep_frames = max(sep_frames, int(round(float(min_separation_seconds) * float(fps))))
 
-    return click_flags.tolist()
+    click_flags = np.zeros(n, dtype=bool)
+    peak_idxs = np.where(peaks)[0]
+    if sep_frames <= 0 or len(peak_idxs) == 0:
+        click_flags = peaks
+        out = click_flags.tolist()
+        if return_halo_centers:
+            return out, halo_centers
+        return out
+
+    # Group nearby peaks and keep the strongest score in each group.
+    cluster_start = int(peak_idxs[0])
+    cluster_best = int(peak_idxs[0])
+    for p in peak_idxs[1:]:
+        p_int = int(p)
+        if (p_int - cluster_start) <= sep_frames:
+            if float(scores[p_int]) > float(scores[cluster_best]):
+                cluster_best = p_int
+        else:
+            click_flags[cluster_best] = True
+            cluster_start = p_int
+            cluster_best = p_int
+    click_flags[cluster_best] = True
+
+    out = click_flags.tolist()
+    if return_halo_centers:
+        return out, halo_centers
+    return out
 
 
 def compute_ui_change_scores(
@@ -270,6 +332,281 @@ def compute_ui_change_scores(
         prev_gray = curr_gray
 
     return scores
+
+
+def compute_cursor_kinematics(
+    positions: list[Tuple[Optional[int], Optional[int]]],
+    fps: float,
+) -> Tuple[list[float], list[float], list[float], list[float]]:
+    """
+    Compute per-frame cursor kinematics:
+      vel_x = (x_t - x_prev) / dt
+      vel_y = (y_t - y_prev) / dt
+      speed = sqrt(vel_x^2 + vel_y^2)
+      acceleration = (speed_t - speed_prev) / dt
+    """
+    n = len(positions)
+    vel_x = [0.0] * n
+    vel_y = [0.0] * n
+    speed = [0.0] * n
+    acceleration = [0.0] * n
+
+    if n == 0:
+        return vel_x, vel_y, speed, acceleration
+
+    dt = 1.0 / float(fps) if fps and fps > 0 else 1.0 / 30.0
+    prev_speed = 0.0
+    prev_valid = False
+
+    for i in range(1, n):
+        x_prev, y_prev = positions[i - 1]
+        x_t, y_t = positions[i]
+        if x_prev is None or y_prev is None or x_t is None or y_t is None:
+            vel_x[i] = 0.0
+            vel_y[i] = 0.0
+            speed[i] = 0.0
+            acceleration[i] = 0.0
+            prev_speed = 0.0
+            prev_valid = False
+            continue
+
+        vx = (float(x_t) - float(x_prev)) / dt
+        vy = (float(y_t) - float(y_prev)) / dt
+        sp = float(np.sqrt(vx * vx + vy * vy))
+        if prev_valid:
+            acc = (sp - prev_speed) / dt
+        else:
+            acc = 0.0
+
+        vel_x[i] = vx
+        vel_y[i] = vy
+        speed[i] = sp
+        acceleration[i] = acc
+
+        prev_speed = sp
+        prev_valid = True
+
+    return vel_x, vel_y, speed, acceleration
+
+
+def _smooth_1d(values: list[float], window: int = 7) -> list[float]:
+    n = len(values)
+    if n == 0:
+        return []
+    w = max(1, int(window))
+    if w == 1:
+        return [float(v) for v in values]
+    if w % 2 == 0:
+        w += 1
+    pad = w // 2
+    arr = np.asarray(values, dtype=np.float32)
+    padded = np.pad(arr, (pad, pad), mode="edge")
+    kernel = np.ones(w, dtype=np.float32) / float(w)
+    out = np.convolve(padded, kernel, mode="valid")
+    return out.astype(np.float32).tolist()
+
+
+def build_smart_zoom_controls(
+    positions: list[Tuple[Optional[int], Optional[int]]],
+    click_events: list[bool],
+    speed_series: list[float],
+    ui_change_scores: list[float],
+    *,
+    fps: float,
+    frame_width: int,
+    frame_height: int,
+    max_zoom: float = 1.6,
+    lookback_seconds: float = 0.25,
+    hold_after_click_seconds: float = 0.5,
+    idle_zoom_out_seconds: float = 0.75,
+    zoom_in_min_seconds: float = 0.18,
+    reanchor_seconds: float = 0.22,
+    low_speed_threshold: Optional[float] = None,
+    interaction_ui_threshold: Optional[float] = None,
+) -> Tuple[list[float], list[Tuple[int, int]]]:
+    """
+    Build per-frame zoom level [0..1] and zoom anchor that satisfy smart click zoom:
+    pre-click settle start, hold, inactivity zoom-out, and smooth re-anchor/pan.
+    """
+    n = len(positions)
+    if n == 0:
+        return [], []
+
+    speed_smooth = _smooth_1d(speed_series, window=7)
+    if len(speed_smooth) < n:
+        speed_smooth = speed_smooth + [0.0] * (n - len(speed_smooth))
+    ui_smooth = _smooth_1d(ui_change_scores, window=5)
+    if len(ui_smooth) < n:
+        ui_smooth = ui_smooth + [0.0] * (n - len(ui_smooth))
+
+    speed_arr = np.asarray(speed_smooth[:n], dtype=np.float32)
+    ui_arr = np.asarray(ui_smooth[:n], dtype=np.float32)
+
+    if low_speed_threshold is None:
+        nonzero = speed_arr[speed_arr > 1e-6]
+        if nonzero.size > 0:
+            low_speed_threshold = float(np.percentile(nonzero, 25))
+        else:
+            low_speed_threshold = 40.0
+    if interaction_ui_threshold is None:
+        interaction_ui_threshold = float(max(0.01, np.percentile(ui_arr, 70)))
+
+    dt = 1.0 / float(fps) if fps and fps > 0 else 1.0 / 30.0
+    back_frames = max(1, int(round(lookback_seconds / dt)))
+    hold_frames = max(1, int(round(hold_after_click_seconds / dt)))
+    idle_frames = max(1, int(round(idle_zoom_out_seconds / dt)))
+    reanchor_frames = max(2, int(round(reanchor_seconds / dt)))
+    zoom_in_min_frames = max(2, int(round(zoom_in_min_seconds / dt)))
+
+    def _valid_pos(i: int) -> Optional[Tuple[int, int]]:
+        if i < 0 or i >= n:
+            return None
+        x, y = positions[i]
+        if x is None or y is None:
+            return None
+        return (int(np.clip(int(x), 0, frame_width - 1)), int(np.clip(int(y), 0, frame_height - 1)))
+
+    def _last_valid_before(i: int) -> Optional[Tuple[int, int]]:
+        j = i
+        while j >= 0:
+            p = _valid_pos(j)
+            if p is not None:
+                return p
+            j -= 1
+        return None
+
+    def _stable_before(i: int) -> Optional[Tuple[int, int]]:
+        lo = max(0, i - back_frames)
+        for j in range(i, lo - 1, -1):
+            if speed_arr[j] <= float(low_speed_threshold):
+                p = _valid_pos(j)
+                if p is not None:
+                    return p
+        return None
+
+    click_idxs = [i for i, c in enumerate(click_events[:n]) if bool(c)]
+    zoom_start_map: dict[int, int] = {}
+    for c in click_idxs:
+        lo = max(0, c - back_frames)
+        settle_idx: Optional[int] = None
+        for j in range(c, lo - 1, -1):
+            if speed_arr[j] <= float(low_speed_threshold):
+                settle_idx = j
+                break
+        start_idx = settle_idx if settle_idx is not None else lo
+        zoom_start_map[start_idx] = c
+
+    level = np.zeros(n, dtype=np.float32)
+    anchors: list[Tuple[int, int]] = [(frame_width // 2, frame_height // 2) for _ in range(n)]
+
+    zoom_active = False
+    hold_until = -1
+    inactivity_count = 0
+    transition_start = -1
+    transition_end = -1
+    transition_from = 0.0
+    transition_to = 0.0
+
+    anchor_curr = (frame_width // 2, frame_height // 2)
+    pan_start = -1
+    pan_end = -1
+    pan_from = anchor_curr
+    pan_to = anchor_curr
+
+    def _begin_zoom_transition(i: int, to_level: float, duration_frames: int) -> None:
+        nonlocal transition_start, transition_end, transition_from, transition_to
+        transition_start = i
+        transition_end = i + max(1, int(duration_frames))
+        transition_from = float(level[i - 1]) if i > 0 else float(level[i])
+        transition_to = float(np.clip(to_level, 0.0, 1.0))
+
+    def _begin_pan(i: int, to_anchor: Tuple[int, int], duration_frames: int) -> None:
+        nonlocal pan_start, pan_end, pan_from, pan_to
+        pan_start = i
+        pan_end = i + max(1, int(duration_frames))
+        pan_from = anchor_curr
+        pan_to = (
+            int(np.clip(int(to_anchor[0]), 0, frame_width - 1)),
+            int(np.clip(int(to_anchor[1]), 0, frame_height - 1)),
+        )
+
+    for i in range(n):
+        if i in zoom_start_map:
+            c = zoom_start_map[i]
+            c_anchor = _stable_before(c)
+            if c_anchor is None:
+                c_anchor = _last_valid_before(c)
+            if c_anchor is None:
+                c_anchor = (frame_width // 2, frame_height // 2)
+            anchor_curr = c_anchor
+            _begin_zoom_transition(i, 1.0, max(zoom_in_min_frames, c - i + 1))
+            zoom_active = True
+
+        if i in click_idxs:
+            click_anchor = _stable_before(i)
+            if click_anchor is None:
+                click_anchor = _last_valid_before(i)
+            if click_anchor is None:
+                click_anchor = anchor_curr
+
+            # Determine if click lies within central 60% of current zoom region.
+            prev_level = float(level[i - 1]) if i > 0 else float(level[i])
+            p = np.clip(prev_level, 0.0, 1.0)
+            p_s = p * p * (3.0 - 2.0 * p)
+            roi_w = float(frame_width) + (float(frame_width) / max(1.0, max_zoom) - float(frame_width)) * p_s
+            roi_h = float(frame_height) + (float(frame_height) / max(1.0, max_zoom) - float(frame_height)) * p_s
+            in_inner = (
+                abs(float(click_anchor[0]) - float(anchor_curr[0])) <= 0.30 * roi_w
+                and abs(float(click_anchor[1]) - float(anchor_curr[1])) <= 0.30 * roi_h
+            )
+
+            # Keep zoomed; smoothly pan/re-anchor without snapping to full frame.
+            pan_frames = reanchor_frames if in_inner else int(round(1.25 * reanchor_frames))
+            _begin_pan(i, click_anchor, pan_frames)
+            _begin_zoom_transition(i, 1.0, max(2, int(round(0.12 / dt))))
+            zoom_active = True
+            hold_until = max(hold_until, i + hold_frames)
+            inactivity_count = 0
+
+        if pan_start >= 0 and pan_end > pan_start and i <= pan_end:
+            tp = float(i - pan_start) / float(max(1, pan_end - pan_start))
+            tp = float(np.clip(tp, 0.0, 1.0))
+            ts = tp * tp * (3.0 - 2.0 * tp)
+            ax = int(round(float(pan_from[0]) + (float(pan_to[0]) - float(pan_from[0])) * ts))
+            ay = int(round(float(pan_from[1]) + (float(pan_to[1]) - float(pan_from[1])) * ts))
+            anchor_curr = (
+                int(np.clip(ax, 0, frame_width - 1)),
+                int(np.clip(ay, 0, frame_height - 1)),
+            )
+        elif pan_end > 0 and i > pan_end:
+            anchor_curr = pan_to
+
+        if transition_start >= 0 and transition_end > transition_start and i <= transition_end:
+            tz = float(i - transition_start) / float(max(1, transition_end - transition_start))
+            tz = float(np.clip(tz, 0.0, 1.0))
+            ts = tz * tz * (3.0 - 2.0 * tz)
+            level[i] = float(transition_from + (transition_to - transition_from) * ts)
+        else:
+            level[i] = float(level[i - 1]) if i > 0 else 0.0
+
+        meaningful_interaction = (ui_arr[i] >= float(interaction_ui_threshold)) or (
+            speed_arr[i] >= float(low_speed_threshold) * 1.25
+        )
+        if zoom_active:
+            if i <= hold_until:
+                inactivity_count = 0
+            elif meaningful_interaction:
+                inactivity_count = 0
+            else:
+                inactivity_count += 1
+                if inactivity_count >= idle_frames and float(level[i]) > 1e-3:
+                    _begin_zoom_transition(i, 0.0, max(zoom_in_min_frames, idle_frames // 2))
+                    zoom_active = False
+                    inactivity_count = 0
+
+        anchors[i] = anchor_curr
+
+    return level.astype(np.float32).tolist(), anchors
 
 '''CURSOR METRICS EXTRACTION: template matching + iterate over all 
    frames + compute match confidence score to template + record cursor
@@ -461,6 +798,13 @@ def visualize_cursor_positions(
     overlay_path = "mac_cursor.png",
     overlay_hotspot_offset = (0, 0),
     overlay_hotspot_xy: Tuple[int, int] = (0, 0),
+    click_events: Optional[list[bool]] = None,
+    click_halo_centers: Optional[list[Optional[Tuple[int, int]]]] = None,
+    click_overlay_gate_radius_px: int = 18,
+    speed_series: Optional[list[float]] = None,
+    ui_change_scores: Optional[list[float]] = None,
+    enable_smart_zoom: bool = True,
+    smart_zoom_max: float = 1.6,
 ):
 
     cap = cv2.VideoCapture(str(video_path))
@@ -499,6 +843,20 @@ def visualize_cursor_positions(
         normal_radius = max(1, int(normal_radius))
         early_radius = max(1, int(early_radius))
 
+        zoom_levels: Optional[list[float]] = None
+        zoom_anchors: Optional[list[Tuple[int, int]]] = None
+        if enable_smart_zoom and click_events is not None and speed_series is not None and ui_change_scores is not None:
+            zoom_levels, zoom_anchors = build_smart_zoom_controls(
+                positions=positions,
+                click_events=click_events,
+                speed_series=speed_series,
+                ui_change_scores=ui_change_scores,
+                fps=float(fps),
+                frame_width=width,
+                frame_height=height,
+                max_zoom=float(smart_zoom_max),
+            )
+
         idx = 0
         if early_seconds is not None:
             early_end_idx = int(early_seconds * fps)
@@ -508,8 +866,53 @@ def visualize_cursor_positions(
                 break
 
             x, y = positions[idx]
+            has_cursor_detection = x is not None and y is not None
+            draw_x, draw_y = x, y
 
-            if x is not None and y is not None:
+            show_overlay = has_cursor_detection
+            if (
+                show_overlay
+                and click_events is not None
+                and idx < len(click_events)
+                and click_events[idx]
+            ):
+                # On click frames, require cursor to stay near detected blue halo center.
+                if (
+                    click_halo_centers is None
+                    or idx >= len(click_halo_centers)
+                    or click_halo_centers[idx] is None
+                ):
+                    show_overlay = False
+                else:
+                    hx_c, hy_c = click_halo_centers[idx]  # type: ignore[misc]
+                    dx_c = float(x) - float(hx_c)  # x is not None because show_overlay is True
+                    dy_c = float(y) - float(hy_c)
+                    if (dx_c * dx_c + dy_c * dy_c) > float(click_overlay_gate_radius_px * click_overlay_gate_radius_px):
+                        show_overlay = False
+
+            # Smart zoom around click episodes.
+            if (
+                zoom_levels is not None
+                and zoom_anchors is not None
+                and idx < len(zoom_levels)
+                and idx < len(zoom_anchors)
+            ):
+                z = float(np.clip(zoom_levels[idx], 0.0, 1.0))
+                if z > 1e-6:
+                    anchor = zoom_anchors[idx]
+                    frame, mapped_cursor, _, _ = zoom_roi(
+                        frame,
+                        (x, y),
+                        z,
+                        max_zoom=float(smart_zoom_max),
+                        fallback_center=anchor,
+                        zoom_anchor=anchor,
+                    )
+                    if mapped_cursor is not None:
+                        draw_x, draw_y = mapped_cursor
+
+            # Only draw overlay when this frame passes visibility gating.
+            if show_overlay and draw_x is not None and draw_y is not None:
                 h0, w0 = overlay_bgr.shape[:2]
                 target_r = early_radius
                 if early_end_idx is not None and early_end_idx > 0 and idx < early_end_idx:
@@ -534,7 +937,7 @@ def visualize_cursor_positions(
                 )
 
                 w, h = target_w, target_h
-                cx, cy = int(x) + ox_off, int(y) + oy_off
+                cx, cy = int(draw_x) + ox_off, int(draw_y) + oy_off
                 # Align overlay hotspot to recorded tip; scale with resize
                 hx_s = hx * (target_w / float(w0)) if w0 else 0.0
                 hy_s = hy * (target_h / float(h0)) if h0 else 0.0
@@ -671,7 +1074,26 @@ if __name__ == "__main__":
         auto_tip_from_mask=True,  # tip = top-left of mask bbox; or set tip_offset_from_top_left
     )
 
-    #do the cursor overlay
+    #retrieve fps from video
+    cap = cv2.VideoCapture(str(video))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    cap.release()
+    fps = float(fps) if fps and fps > 0 else 30.0
+
+    
+    #BUILD DATAFRAME OF FRAME METRICS
+    ui_change_scores = compute_ui_change_scores(frames, cursor_positions)
+    click_events, click_halo_centers = detect_click_events(
+        frames,
+        cursor_positions,
+        halo_reference_path="click_event.png",
+        fps=fps,
+        min_separation_seconds=1.00,
+        return_halo_centers=True,
+    )
+    vel_x, vel_y, speed, acceleration = compute_cursor_kinematics(cursor_positions, fps)
+
+    #do the cursor overlay (with smart click-centric zoom)
     visualize_cursor_positions(
         video,
         cursor_positions,
@@ -681,8 +1103,15 @@ if __name__ == "__main__":
         early_radius=35,
         overlay_path="mac_cursor.png",
         overlay_hotspot_xy=(0, 0),
+        click_events=click_events,
+        click_halo_centers=click_halo_centers,
+        click_overlay_gate_radius_px=18,
+        speed_series=speed,
+        ui_change_scores=ui_change_scores,
+        enable_smart_zoom=True,
+        smart_zoom_max=1.6,
     )
-    
+
     #TRANSCRIPTION METRICS
     try:
         #extract transcription and writes text to file
@@ -694,16 +1123,6 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Transcript extraction failed: {e}")
 
-    #retrieve fps from video
-    cap = cv2.VideoCapture(str(video))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    cap.release()
-    fps = float(fps) if fps and fps > 0 else 30.0
-
-    
-    #BUILD DATAFRAME OF FRAME METRICS
-    ui_change_scores = compute_ui_change_scores(frames, cursor_positions)
-    click_events = detect_click_events(frames, cursor_positions, halo_reference_path="click_event.png")
     for i, is_click in enumerate(click_events):
         if is_click:
             print(f"Click detected at timestamp: {i / fps:.3f}s")
@@ -727,10 +1146,10 @@ if __name__ == "__main__":
             cursor_match_score=float(scores[i]),
             mouse_click_event=click_metric,
             mouse_drag_event=MouseDrag(drag=False, start_pos=0.0, end_pos=0.0),
-            vel_x=0.0,
-            vel_y=0.0,
-            speed=0.0,
-            acceleration=0.0,
+            vel_x=float(vel_x[i]) if i < len(vel_x) else 0.0,
+            vel_y=float(vel_y[i]) if i < len(vel_y) else 0.0,
+            speed=float(speed[i]) if i < len(speed) else 0.0,
+            acceleration=float(acceleration[i]) if i < len(acceleration) else 0.0,
             scene_change_score=0.0,
             mag_pixel_change=0.0,
             nearest_target_objects=[],
