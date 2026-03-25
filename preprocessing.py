@@ -273,12 +273,15 @@ def visualize_cursor_positions(
         idx = 0
         if early_seconds is not None:
             early_end_idx = int(early_seconds * fps)
+        # NOTE: zooming is intentionally not applied during visualization.
+        # `zoom_roi(...)` exists as a reusable helper, but is not called here.
         while True:
             ret, frame = cap.read()
             if not ret or idx >= len(positions):
                 break
 
             x, y = positions[idx]
+
             if x is not None and y is not None:
                 h0, w0 = overlay_bgr.shape[:2]
                 target_r = early_radius
@@ -287,9 +290,14 @@ def visualize_cursor_positions(
                     t_s = t * t * (3.0 - 2.0 * t)
                     target_r = normal_radius + (early_radius - normal_radius) * t_s
 
-                target_h = max(1, int(round(2.0 * target_r)))
-                scale = float(target_h) / float(h0)
-                target_w = max(1, int(round(w0 * scale)))
+                base_target_h = max(1, int(round(2.0 * target_r)))
+                base_scale = float(base_target_h) / float(h0)
+                base_target_w = max(1, int(round(w0 * base_scale)))
+
+                # Keep cursor overlay size driven only by early-radius animation,
+                # not by the camera zoom, so the overlay doesn't "grow" during zoom.
+                target_h = base_target_h
+                target_w = base_target_w
 
                 ov_bgr = cv2.resize(overlay_bgr, (target_w, target_h), interpolation=cv2.INTER_AREA)
                 ov_alpha = cv2.resize(
@@ -331,7 +339,91 @@ def visualize_cursor_positions(
         cap.release()
         writer.release()
 
+"""ZOOMING LOGIC"""
+def zoom_roi(
+    frame: np.ndarray,
+    cursor_pos: Optional[Tuple[Optional[int], Optional[int]]],
+    progress: float,
+    *,
+    max_zoom: float = 2.5,
+    fallback_center: Optional[Tuple[int, int]] = None,
+    zoom_anchor: Optional[Tuple[int, int]] = None,   # NEW
+) -> Tuple[np.ndarray, Optional[Tuple[int, int]], float, float]:
+    if frame is None or frame.size == 0:
+        raise ValueError("zoom_roi received an empty frame.")
 
+    h, w = frame.shape[:2]
+    if h <= 1 or w <= 1:
+        return frame.copy(), None, 1.0, 1.0
+
+    def smoothstep(t: float) -> float:
+        t = float(np.clip(t, 0.0, 1.0))
+        return t * t * (3.0 - 2.0 * t)
+
+    def interpolate(a: float, b: float, t: float) -> float:
+        return a + (b - a) * t
+
+    p = smoothstep(progress)
+
+    start_w, start_h = float(w), float(h)
+    target_w = float(w) / max(1.0, float(max_zoom))
+    target_h = float(h) / max(1.0, float(max_zoom))
+
+    roi_w = int(round(interpolate(start_w, target_w, p)))
+    roi_h = int(round(interpolate(start_h, target_h, p)))
+
+    roi_w = max(2, min(w, roi_w))
+    roi_h = max(2, min(h, roi_h))
+
+    # FIXED zoom center
+    if zoom_anchor is not None:
+        cx, cy = int(zoom_anchor[0]), int(zoom_anchor[1])
+    elif (
+        cursor_pos is not None
+        and len(cursor_pos) == 2
+        and cursor_pos[0] is not None
+        and cursor_pos[1] is not None
+    ):
+        cx, cy = int(cursor_pos[0]), int(cursor_pos[1])
+    elif fallback_center is not None:
+        cx, cy = int(fallback_center[0]), int(fallback_center[1])
+    else:
+        cx, cy = w // 2, h // 2
+
+    cx = int(np.clip(cx, 0, w - 1))
+    cy = int(np.clip(cy, 0, h - 1))
+
+    half_w = roi_w // 2
+    half_h = roi_h // 2
+
+    x0 = max(0, min(w - roi_w, cx - half_w))
+    y0 = max(0, min(h - roi_h, cy - half_h))
+    x1 = x0 + roi_w
+    y1 = y0 + roi_h
+
+    crop = frame[y0:y1, x0:x1]
+    if crop.shape[0] != roi_h or crop.shape[1] != roi_w:
+        return frame.copy(), None, 1.0, 1.0
+
+    zoomed = cv2.resize(crop, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    mapped_cursor = None
+    if (
+        cursor_pos is not None
+        and len(cursor_pos) == 2
+        and cursor_pos[0] is not None
+        and cursor_pos[1] is not None
+    ):
+        sx = w / float(roi_w)
+        sy = h / float(roi_h)
+        mx = int(round((float(cursor_pos[0]) - float(x0)) * sx))
+        my = int(round((float(cursor_pos[1]) - float(y0)) * sy))
+        mapped_cursor = (int(np.clip(mx, 0, w - 1)), int(np.clip(my, 0, h - 1)))
+
+    scale_x = w / float(roi_w)
+    scale_y = h / float(roi_h)
+
+    return zoomed, mapped_cursor, scale_x, scale_y
 if __name__ == "__main__":
     cursor_template = "cursor.png"
     frames = get_frames(video)
